@@ -27,6 +27,7 @@
 #define FORMAT_HAMR_EKS (3)
 #define FORMAT_IHARM_v1 (1)
 #define FORMAT_KORAL_v2 (4)
+
 int dumpfile_format = 0;
 
 // UNITS
@@ -46,7 +47,7 @@ static double mu_i, mu_e, mu_tot;
 
 // MODEL PARAMETERS: PUBLIC
 double DTd;
-double sigma_cut = 1.;
+double sigma_cut = 1.0;
 double beta_crit = 1.0;
 double sigma_cut_high = -1.0;
 
@@ -77,16 +78,18 @@ double tf;
 //static double t0;
 
 // ELECTRONS
-//    0 : constant TP_OVER_TE
-//    1 : use dump file model (kawazura?)
-//    2 : use mixed TP_OVER_TE (beta model)
-//    3 : use mixed TP_OVER_TE (beta model) with fluid temperature
-//    9 : load Te (in Kelvin) from dump file (KORAL etc.)
-// TODO the way this is selected is horrid.  Make it a parameter.
-#define ELECTRONS_TFLUID (3)
-static int RADIATION, ELECTRONS;
-static double gam = 1.444444444444444, game = 1.333333333333333, gamp = 1.666666666666667;
+#define ELECTRON_CONSTANT (0) // constant TP_OVER_TE
+#define ELECTRON_DUMP (1) // use dump file model (kawazura?)
+#define ELECTRON_BETA (2) // use mixed TP_OVER_TE (beta model)
+#define ELECTRON_TFLUID (3)// use mixed TP_OVER_TE (beta model) with fluid temperature
+#define ELECTRON_SPO2023 (4) // use mixed TP_OVER_TE (Satapathy et al., 2023/2024)
+#define ELECTRON_KORAL (9) // load Te (in Kelvin) from dump file (KORAL etc.)
+
+static int RADIATION, ELECTRONS = ELECTRON_SPO2023;
+static double gam = 1.444444, game = 1.333333, gamp = 1.666667;
 static double Thetae_unit, Mdotedd;
+
+static double qshear, nR;
 
 // Ignore radiation interactions within one degree of polar axis
 static double polar_cut = -1;
@@ -95,10 +98,6 @@ static int nloaded = 0;
 
 
 static hdf5_blob fluid_header = { 0 };
-
-
-// Debug KHARMA reader
-#define DEBUG_READER (0)
 
 struct of_data {
   double t;
@@ -137,6 +136,8 @@ void try_set_model_parameter(const char *word, const char *value)
   set_by_word_val(word, value, "mdot", &target_mdot, TYPE_DBL);
 
   set_by_word_val(word, value, "dump", (void *)fnam, TYPE_STR);
+  set_by_word_val(word, value, "qshear", &qshear, TYPE_DBL);
+  set_by_word_val(word, value, "nR", &nR, TYPE_DBL);
 
   set_by_word_val(word, value, "tp_over_te", &tp_over_te, TYPE_DBL);
   set_by_word_val(word, value, "trat_small", &trat_small, TYPE_DBL);
@@ -332,59 +333,6 @@ void init_model(double *tA, double *tB)
       th_beg = 0.0174 * 2;
     }
   }
-
-  #if DEBUG_READER
-    /* Set filename */
-    char debug_fname[256];
-    snprintf(debug_fname, sizeof(debug_fname), "debug_reader_iharm.h5");
-
-    /* Create HDF5 file*/
-    hdf5_create(debug_fname);
-
-    /* Compute gcov, gcon */
-    size_t total_elements = NDIM * NDIM * (N2 + 2) * (N1 + 2);
-    double *gcov_global = malloc(total_elements * sizeof(double));
-    double *gcon_global = malloc(total_elements * sizeof(double));
-    // Use the arrays via indexing. For example, to access element [mu][nu][j][i]:
-    #define IDX(mu, nu, j, i) (((mu) * NDIM * (N2+2) * (N1+2)) + ((nu) * (N2+2) * (N1+2)) + ((j) * (N1+2)) + (i))
-
-#pragma omp parallel for collapse(2)
-  for (int i = 0; i < N1+2; i++) {
-    for (int j = 0; j < N2+2; j++) {
-
-      double X[NDIM] = {0.};
-      ijktoX(i, j, 0, X);
-      double gcov[NDIM][NDIM], gcon[NDIM][NDIM];
-      gcov_func(X, gcov);
-      gcon_func(gcov, gcon);
-
-      for (int mu = 0; mu < NDIM; mu++) {
-        for (int nu = 0; nu < NDIM; nu++) {
-          gcov_global[IDX(mu, nu, j, i)] = gcov[mu][nu];
-          gcon_global[IDX(mu, nu, j, i)] = gcon[mu][nu];
-        }
-      }
-
-    }
-  }
-
-    /* Write gcov, gcon to file */
-    hsize_t dims_grid[4] = { NDIM, NDIM, N2+2, N1+2 };
-    hdf5_write_full_array(gcov_global, "gcov", 4, dims_grid, H5T_NATIVE_DOUBLE);
-    hdf5_write_full_array(gcon_global, "gcon", 4, dims_grid, H5T_NATIVE_DOUBLE);
-
-    /* Write physical quantities */
-    hsize_t dims_phys[3] = { N1+2, N2+2, N3+2 };
-    hdf5_write_full_array(data[0]->ne[0][0], "ne", 3, dims_phys, H5T_NATIVE_DOUBLE);
-    hdf5_write_full_array(data[0]->thetae[0][0], "thetae", 3, dims_phys, H5T_NATIVE_DOUBLE);
-    hdf5_write_full_array(data[0]->b[0][0], "b", 3, dims_phys, H5T_NATIVE_DOUBLE);
-    hdf5_write_full_array(data[0]->sigma[0][0], "sigma", 3, dims_phys, H5T_NATIVE_DOUBLE);
-    hdf5_write_full_array(data[0]->beta[0][0], "beta", 3, dims_phys, H5T_NATIVE_DOUBLE);
-
-    /* Close HDF5 file */
-    hdf5_close();
-
-  #endif // DEBUG_READER
 }
 
 /*
@@ -613,7 +561,6 @@ void init_physical_quantities(int n, double rescale_factor)
 #endif
 
   rescale_factor = sqrt(rescale_factor);
-
   // cover everything, even ghost zones
 #pragma omp parallel for collapse(3)
   for (int i = 0; i < N1+2; i++) {
@@ -637,11 +584,11 @@ void init_physical_quantities(int n, double rescale_factor)
           beta_m = INFINITY;
           fprintf(stderr, "Setting INF beta!\n");
         }
-#endif
-        if (ELECTRONS == 1) {
+#endif  
+        if (ELECTRONS == ELECTRON_DUMP) {
           data[n]->thetae[i][j][k] = data[n]->p[KEL][i][j][k] * 
                                      pow(data[n]->p[KRHO][i][j][k],game-1.)*Thetae_unit;
-        } else if (ELECTRONS == 2) {
+        } else if (ELECTRONS == ELECTRON_BETA) {
           double betasq = beta_m*beta_m / beta_crit/beta_crit;
           double trat = trat_large * betasq/(1. + betasq) + trat_small /(1. + betasq);
           //Thetae_unit = (gam - 1.) * (MP / ME) / trat;
@@ -649,10 +596,25 @@ void init_physical_quantities(int n, double rescale_factor)
           double lcl_Thetae_u = (MP/ME) * (game-1.) * (gamp-1.) / ( (gamp-1.) + (game-1.)*trat );
           Thetae_unit = lcl_Thetae_u;
           data[n]->thetae[i][j][k] = lcl_Thetae_u*data[n]->p[UU][i][j][k]/data[n]->p[KRHO][i][j][k];
-        } else if (ELECTRONS == 9) {
+        } else if (ELECTRONS == ELECTRON_SPO2023){
+          double zeta = 0.2;
+          double betasq = beta_m * beta_m/beta_crit/beta_crit;
+          
+          double k_eff = 0.42 * sqrt(qshear * (4. - qshear)) / 2.;
+          double gam_km = sqrt(sqrt(pow(2. - qshear, 2.) + 4 * pow(k_eff, 2.)) - (pow(k_eff, 2.)+ (2-qshear)));
+          double Ps_over_Pa = 0.5 *(qshear * (2. + 2. * (2. - qshear) / (pow(k_eff, 2.) + pow(gam_km, 2.))) - 2.); 
+          double f = 35. / (1. + pow(beta_m/15., -1.4)) + Ps_over_Pa; 
+            
+          double game = 4./3. + 0.13 * bsq / (1. + bsq);
+          double gamp_eff = 1. + 1. / ((1 + 2. * zeta / beta_m) / (gamp - 1.));
+          
+          double trat = (gamp_eff - 1.) * (1. - (game - 1.) * (2. - nR)) * f / ((game - 1.) * (1. - (gamp_eff - 1.) * (2. - nR) * (1. + 2. * zeta / beta_m)));
+          double lcl_Thetae_u = (MP/ME) * (game-1.) * (gamp_eff-1.) / ( (gamp_eff-1.) + (game-1.)*trat );
+          data[n]->thetae[i][j][k] = lcl_Thetae_u*data[n]->p[UU][i][j][k]/data[n]->p[KRHO][i][j][k];
+        } else if (ELECTRONS == ELECTRON_KORAL) {
           // convert Kelvin -> Thetae
           data[n]->thetae[i][j][k] = data[n]->p[TFLK][i][j][k] * KBOL / ME / CL / CL;
-        } else if (ELECTRONS == ELECTRONS_TFLUID) {
+        } else if (ELECTRONS == ELECTRON_TFLUID) {
           double beta = data[n]->p[UU][i][j][k]*(gam-1.)/0.5/bsq;
           double betasq = beta*beta / beta_crit/beta_crit;
           double trat = trat_large * betasq/(1. + betasq) + trat_small /(1. + betasq);
@@ -670,7 +632,6 @@ void init_physical_quantities(int n, double rescale_factor)
           fprintf(stderr, "Setting floor temp!\n");
         }
 #endif
-
         // Enforce a max on Thetae based on cooling time == dynamical time
         if (cooling_dynamical_times > 1e-20) {
           double X[NDIM];
@@ -740,7 +701,7 @@ void init_grid(char *fnam, int dumpidx)
 void init_hamr_grid(char *fnam, int dumpidx) 
 {
   // no support for electron thermodynamics or radiation
-  ELECTRONS = 0;
+  //ELECTRONS = 0;
   RADIATION = 0;
 
   char fname[256];
@@ -764,24 +725,18 @@ void init_hamr_grid(char *fnam, int dumpidx)
   game = 4./3; gamp = 5./3;
 
   Te_unit = Thetae_unit;
-  // we can override which electron model to use here. print results if we're
-  // overriding anything. ELECTRONS should only be nonzero if we need to make
-  // use of extra variables (instead of just UU and RHO) for thetae
-  if (!USE_FIXED_TPTE && !USE_MIXED_TPTE) {
-    fprintf(stderr, "! no electron temperature model specified in model/iharm.c\n");
-    exit(-3);
-  } else if (USE_FIXED_TPTE && !USE_MIXED_TPTE) {
-    ELECTRONS = 0; // force TP_OVER_TE to overwrite bad electrons
-    fprintf(stderr, "using fixed tp_over_te ratio = %g\n", tp_over_te);
-    //Thetae_unit = MP/ME*(gam-1.)*1./(1. + tp_over_te);
-    // see, e.g., Eq. 8 of the EHT GRRT formula list.
-    // this formula assumes game = 4./3 and gamp = 5./3
-    Thetae_unit = 2./3. * MP/ME / (2. + tp_over_te);
-  } else if (USE_MIXED_TPTE && !USE_FIXED_TPTE) {
-    ELECTRONS = 2;
-    fprintf(stderr, "using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n",
-      trat_small, trat_large, beta_crit);
-    // Thetae_unit set per-zone below
+  if (ELECTRONS == ELECTRON_CONSTANT) {
+      fprintf(stderr, "using fixed tp_over_te ratio = %g\n", tp_over_te);
+      //Thetae_unit = MP/ME*(gam-1.)*1./(1. + tp_over_te);
+      // see, e.g., Eq. 8 of the EHT GRRT formula list.
+      // this formula assumes game = 4./3 and gamp = 5./3
+      Thetae_unit = 2./3. * MP/ME / (2. + tp_over_te);
+  } else if (ELECTRONS == ELECTRON_BETA){
+      fprintf(stderr, "using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n",
+        trat_small, trat_large, beta_crit);  // Thetae_unit set per-zone below
+  } else if (ELECTRONS == ELECTRON_SPO2023) {
+      fprintf(stderr, "using Satapathy 2023, 2024 model with qshear = %g, nR = %g, and beta_crit = %g\n",
+        qshear, nR, beta_crit);
   } else {
     fprintf(stderr, "! please change electron model in model/iharm.c\n");
     exit(-3);
@@ -860,8 +815,6 @@ void init_iharm_grid(char *fnam, int dumpidx)
 
   if ( hdf5_exists("has_electrons") ) {
     hdf5_read_single_val(&ELECTRONS, "has_electrons", H5T_STD_I32LE);
-  } else {
-    ELECTRONS = 0;
   }
   if ( hdf5_exists("has_radiation") ) {
     hdf5_read_single_val(&RADIATION, "has_radiation", H5T_STD_I32LE);
@@ -881,7 +834,7 @@ void init_iharm_grid(char *fnam, int dumpidx)
     fprintf(stderr, "Loaded molecular weights (mu_i, mu_e, mu_tot): %g %g %g\n", mu_i, mu_e, mu_tot);
     Ne_factor = 1. / mu_e;
     hdf5_set_directory("/header/");
-    ELECTRONS = ELECTRONS_TFLUID;
+    ELECTRONS = ELECTRON_TFLUID;
   }
 
   char metric_name[20];
@@ -919,41 +872,36 @@ void init_iharm_grid(char *fnam, int dumpidx)
   hdf5_read_single_val(&N3, "n3", H5T_STD_I32LE);
   hdf5_read_single_val(&gam, "gam", H5T_IEEE_F64LE);
 
-  if (hdf5_exists("gam_e")) { /* pyharm-converted files save gam_e, gam_p even when electrons are not run. Which overwrites the default values*/
+  if (hdf5_exists("gam_e")) {
     fprintf(stderr, "custom electron model loaded from dump file...\n");
     hdf5_read_single_val(&game, "gam_e", H5T_IEEE_F64LE);
     hdf5_read_single_val(&gamp, "gam_p", H5T_IEEE_F64LE);
   } // Else use default values set above
   Te_unit = Thetae_unit;
-
+  fprintf(stderr,"Using gamma_p = %g, gamma_e = %g\n", gamp, game);
   // we can override which electron model to use here. print results if we're
   // overriding anything. ELECTRONS should only be nonzero if we need to make
   // use of extra variables (instead of just UU and RHO) for thetae
-  if (!USE_FIXED_TPTE && !USE_MIXED_TPTE) {
-    if (ELECTRONS != 1) {
-      fprintf(stderr, "! no electron temperature model specified! Cannot continue\n");
-      exit(-3);
-    }
-    ELECTRONS = 1;
-    Thetae_unit = MP/ME;
-  } else if (ELECTRONS == ELECTRONS_TFLUID) {
-    fprintf(stderr, "Using Ressler/Athena electrons with mixed tp_over_te and\n");
-    fprintf(stderr, "trat_small = %g, trat_large = %g, and beta_crit = %g\n", trat_small, trat_large, beta_crit);
-  } else if (USE_FIXED_TPTE && !USE_MIXED_TPTE) {
-    ELECTRONS = 0; // force TP_OVER_TE to overwrite bad electrons
-    fprintf(stderr, "Using fixed tp_over_te ratio = %g\n", tp_over_te);
-    //Thetae_unit = MP/ME*(gam-1.)*1./(1. + tp_over_te);
-    // see, e.g., Eq. 8 of the EHT GRRT formula list. 
-    // this formula assumes game = 4./3 and gamp = 5./3
-    Thetae_unit = 2./3. * MP/ME / (2. + tp_over_te);
-  } else if (USE_MIXED_TPTE && !USE_FIXED_TPTE) {
-    ELECTRONS = 2;
-    fprintf(stderr, "Using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n", 
-      trat_small, trat_large, beta_crit);
-    // Thetae_unit set per-zone below
+  if (ELECTRONS == ELECTRON_TFLUID) {
+      fprintf(stderr, "Using Ressler/Athena electrons with mixed tp_over_te and\n");
+      fprintf(stderr, "trat_small = %g, trat_large = %g, and beta_crit = %g\n", trat_small, trat_large, beta_crit);
+  } else if (ELECTRONS == ELECTRON_CONSTANT) {
+      //ELECTRONS = 0; // force TP_OVER_TE to overwrite bad electrons
+      fprintf(stderr, "Using fixed tp_over_te ratio = %g\n", tp_over_te);
+      //Thetae_unit = MP/ME*(gam-1.)*1./(1. + tp_over_te);
+      // see, e.g., Eq. 8 of the EHT GRRT formula list. 
+      // this formula assumes game = 4./3 and gamp = 5./3
+      Thetae_unit = 2./3. * MP/ME / (2. + tp_over_te);
+  } else if (ELECTRONS == 2) {
+      fprintf(stderr, "Using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n", 
+        trat_small, trat_large, beta_crit);
+      // Thetae_unit set per-zone below
+  } else if (ELECTRONS == ELECTRON_SPO2023) {
+      fprintf(stderr, "Using SPO2023 with qshear = %g, nR = %g, and beta_crit = %g\n",
+        qshear, nR, beta_crit);
   } else {
-    fprintf(stderr, "Unknown electron model %d! Cannot continue.\n", ELECTRONS);
-    exit(-3);
+      fprintf(stderr, "Unknown electron model %d! Cannot continue.\n", ELECTRONS);
+      exit(-3);
   }
   fprintf(stderr, "sigma_cut = %g\n", sigma_cut);
 
@@ -1223,16 +1171,16 @@ void init_koral_grid(char *fnam, int dumpidx)
     if (ELECTRONS) {
       fprintf(stderr, "koral dump has native electron temperature. forcing Thetae...\n");
       ELECTRONS = 9;
-    } else {
-      if (USE_MIXED_TPTE && !USE_FIXED_TPTE) {
-        fprintf(stderr, "Using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n", trat_small, trat_large, beta_crit);
-        ELECTRONS = 2;
-      } else {
-        fprintf(stderr, "! koral unsupported without native electrons or mixed tp_over_te.\n");
-        exit(6);
-      }
-    }
+    } 
+  } else if (ELECTRONS == ELECTRON_BETA) { 
+    fprintf(stderr, "Using mixed tp_over_te with trat_small = %g, trat_large = %g, and beta_crit = %g\n", trat_small, trat_large, beta_crit);
+  } else if (ELECTRONS == ELECTRON_SPO2023) {
+    fprintf(stderr, "Using SPO2023 with qshear = %g, nR = %g, and beta_crit = %g\n", qshear, nR, beta_crit);
+  } else {
+    fprintf(stderr, "! koral unsupported without native electrons or mixed tp_over_te.\n");
+    exit(6);
   }
+  
 
   fprintf(stderr, "sigma_cut = %g\n", sigma_cut);
   
@@ -1270,13 +1218,13 @@ void output_hdf5()
   hdf5_write_single_val(&sigma_cut, "sigma_cut", H5T_IEEE_F64LE);
   hdf5_make_directory("electrons");
   hdf5_set_directory("/header/electrons/");
-  if (ELECTRONS == 0) {
+  if (ELECTRONS == ELECTRON_CONSTANT){
     hdf5_write_single_val(&tp_over_te, "tp_over_te", H5T_IEEE_F64LE);
-  } else if (ELECTRONS == 2) {
+  } else if (ELECTRONS == ELECTRON_BETA) {
     hdf5_write_single_val(&trat_small, "rlow", H5T_IEEE_F64LE);
     hdf5_write_single_val(&trat_large, "rhigh", H5T_IEEE_F64LE);
     hdf5_write_single_val(&beta_crit, "beta_crit", H5T_IEEE_F64LE);
-  } else if (ELECTRONS == ELECTRONS_TFLUID) {
+  } else if (ELECTRONS == ELECTRON_TFLUID) {
     hdf5_write_single_val(&mu_i, "mu_i", H5T_IEEE_F64LE);
     hdf5_write_single_val(&mu_e, "mu_e", H5T_IEEE_F64LE);
     hdf5_write_single_val(&mu_tot, "mu_tot", H5T_IEEE_F64LE);
@@ -1916,7 +1864,7 @@ void load_iharm_data(int n, char *fnam, int dumpidx, int verbose)
   fstart[3] = 7;
   hdf5_read_array(data[n]->p[B3][0][0], "prims", 4, fdims, fstart, fcount, mdims, mstart, H5T_IEEE_F64LE); 
 
-  if (ELECTRONS == 1) {
+  if (ELECTRONS == ELECTRON_DUMP) {
     fstart[3] = 8;
     hdf5_read_array(data[n]->p[KEL][0][0], "prims", 4, fdims, fstart, fcount, mdims, mstart, H5T_IEEE_F64LE);
     fstart[3] = 9;
@@ -1938,7 +1886,7 @@ void load_iharm_data(int n, char *fnam, int dumpidx, int verbose)
   }
   hdf5_read_single_val(&(data[n]->t), "t", H5T_IEEE_F64LE);
 
-  if (ELECTRONS == ELECTRONS_TFLUID) {
+  if (ELECTRONS == ELECTRON_TFLUID) {
     fstart[3] = 8;
     hdf5_read_array(data[n]->p[THF][0][0], "prims", 4, fdims, fstart, fcount, mdims, mstart, H5T_IEEE_F64LE);
   }
